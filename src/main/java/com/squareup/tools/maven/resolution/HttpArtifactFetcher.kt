@@ -20,10 +20,18 @@ import com.squareup.tools.maven.resolution.FetchStatus.RepositoryFetchStatus.FET
 import com.squareup.tools.maven.resolution.FetchStatus.RepositoryFetchStatus.NOT_FOUND
 import com.squareup.tools.maven.resolution.FetchStatus.RepositoryFetchStatus.SUCCESSFUL
 import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.nio.file.Path
+import java.util.regex.Pattern
+import okhttp3.Authenticator
+import okhttp3.Credentials
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Request.Builder
+import okhttp3.Response
+import okhttp3.Route
+
 import org.apache.maven.model.Repository
 
 /**
@@ -39,9 +47,97 @@ import org.apache.maven.model.Repository
  * TODO: Handle snapshots
  */
 class HttpArtifactFetcher(
-  cacheDir: Path,
-  private val client: OkHttpClient = OkHttpClient()
+  cacheDir: Path
 ) : AbstractArtifactFetcher(cacheDir) {
+
+  private val client: OkHttpClient
+
+  val DEFAULT_PROXY_PORT = 80
+
+  init {
+    if (System.getenv("https_proxy") != null) {
+      client = createProxy(System.getenv("https_proxy"))
+    } else {
+      client = OkHttpClient()
+    }
+  }
+
+  @Throws(IOException::class)
+  fun createProxy(proxyAddress: String?): OkHttpClient {
+    if (proxyAddress.isNullOrEmpty()) {
+      return OkHttpClient()
+    }
+
+    // Here there be dragons.
+    val urlPattern =
+      Pattern.compile("^(https?)://(([^:@]+?)(?::([^@]+?))?@)?([^:]+)(?::(\\d+))?/?$")
+    val matcher = urlPattern.matcher(proxyAddress)
+    if (!matcher.matches()) {
+      throw IOException("Proxy address $proxyAddress is not a valid URL")
+    }
+
+    val protocol = matcher.group(1)
+    val idAndPassword = matcher.group(2)
+    val username = matcher.group(3)
+    val password = matcher.group(4)
+    val hostname = matcher.group(5)
+    val portRaw = matcher.group(6)
+    var cleanProxyAddress = proxyAddress
+    if (idAndPassword != null) {
+      cleanProxyAddress =
+        proxyAddress!!.replace(idAndPassword, "") // Used to remove id+pwd from logging
+    }
+
+    val https: Boolean
+    https = when (protocol) {
+      "https" -> true
+      "http" -> false
+      else -> throw IOException("Invalid proxy protocol for $cleanProxyAddress")
+    }
+    var port = if (https) 443 else 80 // Default port numbers
+    if (portRaw != null) {
+      port = try {
+        portRaw.toInt()
+      } catch (e: NumberFormatException) {
+        throw IOException("Error parsing proxy port: $cleanProxyAddress", e)
+      }
+    }
+
+    val builder = OkHttpClient.Builder()
+    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(hostname, port))
+    builder.proxy(builder)
+
+    val proxyAuthenticator: Authenticator
+
+    if (username != null) {
+      if (password == null) {
+        throw IOException("No password given for proxy $cleanProxyAddress")
+      }
+      println ("Setting proxy configuration $cleanProxyAddress")
+
+      val credentials = Credentials.basic(username, password)
+
+      proxyAuthenticator = object : Authenticator {
+        override fun authenticate(
+          route: Route?,
+          response: Response
+        ): Request? {
+          val request = response.request
+
+          return request
+            .newBuilder()
+            .header("Proxy-Authorization", credentials)
+            .build()
+        }
+      }
+      if (proxyAuthenticator != null) {
+        builder.proxyAuthenticator(proxyAuthenticator)
+      }
+    }
+
+    return builder.build()
+
+  }
 
   override fun fetchFile(
     fileSpec: FileSpec,
